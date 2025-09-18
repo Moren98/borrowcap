@@ -14,20 +14,20 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
 # Frecuencias
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))                 # HypurrFi loop
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))                 # HypurrFi loop continuo
 HL_REFRESH_SECONDS = int(os.getenv("HL_REFRESH_SECONDS", "600"))    # HyperLend: 10 min por defecto
 
 # Umbrales/holguras
-FREE_SLOT_DELTA = float(os.getenv("FREE_SLOT_DELTA", "0.005"))  # 0.5% para considerar “holgura” bajo 100%
+FREE_SLOT_DELTA = float(os.getenv("FREE_SLOT_DELTA", "0.005"))  # 0.5% bajo 100%
 FREE_SLOT_COOLDOWN_MIN = int(os.getenv("FREE_SLOT_COOLDOWN_MIN", "5"))  # anti-spam HyperLend
-MIN_FREE_TOKENS = float(os.getenv("MIN_FREE_TOKENS", "5"))  # mínimo de beHYPE libres para avisar en HypurrFi
+MIN_FREE_TOKENS = float(os.getenv("MIN_FREE_TOKENS", "5"))  # mínimo libres en HypurrFi
 
 # HyperLend API
 API_BASE = os.getenv("HYPERLEND_API_BASE", "https://api.hyperlend.finance").rstrip("/")
 CHAIN = "hyperEvm"
 API_URL = f"{API_BASE}/data/markets"
 API_URL_RATES = f"{API_BASE}/data/markets/rates"
-STALE_SECS = int(os.getenv("STALE_SECS", "300"))  # cache “aceptable” si la API falla (5 min)
+STALE_SECS = int(os.getenv("STALE_SECS", "300"))  # cache si la API falla (5 min)
 
 # HypurrFi (pooled market)
 HYPURR_CHAIN_ID = os.getenv("HYPURR_CHAIN_ID", "999").strip()
@@ -101,7 +101,7 @@ def _get_json_with_retries(url, params, retries=5, timeout=15):
                 raise requests.HTTPError(f"{r.status_code} {r.text}")
             r.raise_for_status()
             return r.json()
-        except requests.RequestException as e:
+        except requests.RequestException:
             if i == retries - 1:
                 raise
             time.sleep(backoff)
@@ -116,7 +116,7 @@ def hl_fetch_reserves():
         HL_LAST_RESERVES, HL_LAST_TS = reserves, time.time()
         return reserves, False
     except Exception:
-        # Pruébalo para diagnóstico (no usamos respuesta)
+        # Diagnóstico: probar rates
         try:
             _ = _get_json_with_retries(API_URL_RATES, {"chain": CHAIN}, retries=3, timeout=10)
             print("[warn] /data/markets falla pero /rates responde; usando cache si existe.")
@@ -128,11 +128,6 @@ def hl_fetch_reserves():
         raise
 
 def hl_compute_borrow_and_util(res):
-    """
-    - variableDebt(base units) = totalScaledVariableDebt * variableBorrowIndex / RAY
-    - totalBorrow(tokens) = (variableDebt + totalPrincipalStableDebt) / 10**decimals
-    - utilization = totalBorrow(tokens) / borrowCap (si borrowCap>0)
-    """
     decimals = int(res.get("decimals", "18"))
     borrow_cap_tokens = Decimal(res.get("borrowCap", "0"))
     scaled_var = Decimal(res.get("totalScaledVariableDebt", "0"))
@@ -179,7 +174,6 @@ def hyperlend_refresher_loop():
             if stale:
                 print("[warn] HyperLend usando cache del último pulso (API 500/timeout)")
 
-            # Notificaciones solo en este pulso
             for res in reserves or []:
                 if not should_track(res):
                     continue
@@ -216,7 +210,7 @@ def hyperlend_refresher_loop():
 # HypurrFi: scraping de la página del activo (beHYPE)
 # =========================
 def parse_money_or_units(txt):
-    # acepta 200K / 3.2M / 12345.67  (quitamos comas)
+    # acepta 200K / 3.2M / 12345.67 (quitamos comas)
     txt = txt.replace(",", "")
     m = re.search(r"([0-9]+(?:\.[0-9]+)?)([KMBT]?)\b", txt)
     if not m:
@@ -242,7 +236,6 @@ def hypurr_fetch_status():
 
     borrowed = None
     cap = None
-    # Buscar “Total borrowed …” y “Borrow cap …”
     for label in ["Total borrowed", "Total Borrows", "Total borrowed "]:
         if label in text:
             seg = text.split(label, 1)[1][:160]
@@ -274,10 +267,9 @@ def hypurr_monitor_loop():
             else:
                 available = max(0.0, (cap or 0) - (borrowed or 0))
                 now = time.time()
-                # Avisar solo al pasar de capado a libre con holgura Y con mínimo disponible
+                # Aviso al pasar de capado a libre con holgura + mínimo disponible
                 if hypurr_last_state_capped is True and util <= (1.0 - FREE_SLOT_DELTA) and available >= MIN_FREE_TOKENS:
-                    # anti-spam
-                    if now - hypurr_last_free_ts >= 60:  # 1 min de respiro por si flapea
+                    if now - hypurr_last_free_ts >= 60:  # respiro 1 min por si flapea
                         send(
                             "🟢 [HypurrFi] Se abrió hueco para pedir prestado beHYPE\n"
                             f"Utilización: {util*100:.2f}%  |  Borrow {human(borrowed)} / Cap {human(cap)}  |  Disponible ≈ {available:,.2f}\n"
@@ -326,13 +318,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reserves = HL_LAST_RESERVES
         stale_note = ""
         if not reserves or (time.time() - HL_LAST_TS) > HL_REFRESH_SECONDS * 2:
-            # Si no hay datos aún (por ejemplo, bot recién iniciado), intentar una lectura única
             try:
                 reserves, stale = hl_fetch_reserves()
                 if stale:
                     stale_note = " (cache)"
-            except Exception as e:
-                parts.append(f"📊 HyperLend: sin datos aún (la API podría estar caída).")
+            except Exception:
+                parts.append("📊 HyperLend: sin datos aún (la API podría estar caída).")
                 reserves = None
         age_min = int((time.time() - HL_LAST_TS) / 60) if HL_LAST_TS else None
         if reserves:
@@ -351,30 +342,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # Lanzadores
 # =========================
-def start_polling_thread():
+def run_polling_main():
     if not BOT_TOKEN:
         print("[WARN] Falta TELEGRAM_BOT_TOKEN para polling.")
         return
-
-    def runner():
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
-        app.add_handler(CommandHandler("start", cmd_start))
-        app.add_handler(CommandHandler("status", cmd_status))
-        print("Telegram polling iniciado.")
-        app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=5)
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    print("Telegram polling iniciado (hilo principal).")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=5)
 
 # =========================
 # Main
 # =========================
 if __name__ == "__main__":
-    start_polling_thread()
     # HyperLend: refresco lento (cada 10 min)
     threading.Thread(target=hyperlend_refresher_loop, daemon=True).start()
     # HypurrFi: monitor continuo
     threading.Thread(target=hypurr_monitor_loop, daemon=True).start()
-    # Mantener vivo
-    while True:
-        time.sleep(3600)
+    # Telegram en el hilo principal (evita errores de event loop en threads)
+    run_polling_main()
